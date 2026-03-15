@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+# MISE description="Run backend plugin smoke tests across a representative JLL matrix"
+
+from __future__ import annotations
+
+import json
+import os
+import platform
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def default_data_dir() -> Path:
+    override = os.environ.get("MISE_DATA_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / ".local/share/mise"
+
+
+DATA_DIR = default_data_dir()
+EXEC_SMOKE_TESTS = {
+    "git": ["git", "--version"],
+    "openssl": ["openssl", "version"],
+    "sqlite": ["sqlite3", "--version"],
+    "jq": ["jq", "--version"],
+    "xz": ["xz", "--version"],
+    "bzip2": ["bzip2", "-h"],
+    "p7zip": ["7z"],
+}
+LIBRARY_ASSERTIONS = {
+    "zlib": {
+        "min_packages": 1,
+        "min_lib_entries": 1,
+        "min_path_entries": 0,
+        "required_package": "Zlib_jll",
+    },
+}
+VERSION_TOOLS = [*EXEC_SMOKE_TESTS.keys(), *LIBRARY_ASSERTIONS.keys()]
+EXPECTED_LIB_ENV = {
+    "Darwin": "DYLD_FALLBACK_LIBRARY_PATH",
+    "Linux": "LD_LIBRARY_PATH",
+}.get(platform.system(), "LD_LIBRARY_PATH")
+
+
+def format_cmd(cmd: list[str]) -> str:
+    return " ".join(cmd)
+
+
+def run(
+    cmd: list[str],
+    *,
+    capture: bool = False,
+    retries: int = 1,
+    retry_delay: float = 2.0,
+) -> str:
+    attempt = 1
+    last_exc: subprocess.CalledProcessError | None = None
+
+    def invoke(*, verbose: bool = False) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        if verbose:
+            env["MISE_VERBOSE"] = "1"
+        return subprocess.run(
+            cmd,
+            check=True,
+            text=True,
+            capture_output=capture or verbose,
+            env=env,
+        )
+
+    while attempt <= retries:
+        try:
+            result = invoke()
+            if capture:
+                return result.stdout
+            return ""
+        except subprocess.CalledProcessError as exc:
+            last_exc = exc
+            if attempt < retries:
+                say(
+                    f"retrying ({attempt}/{retries - 1}) after failure: {format_cmd(cmd)}"
+                )
+                if exc.stdout:
+                    print(exc.stdout, file=sys.stderr, end="")
+                if exc.stderr:
+                    print(exc.stderr, file=sys.stderr, end="")
+                time.sleep(retry_delay)
+                attempt += 1
+                continue
+            break
+
+    assert last_exc is not None
+    print(f"command failed: {format_cmd(cmd)}", file=sys.stderr)
+    if last_exc.stdout:
+        print(last_exc.stdout, file=sys.stderr, end="")
+    if last_exc.stderr:
+        print(last_exc.stderr, file=sys.stderr, end="")
+    if cmd and cmd[0] == "mise":
+        print(f"rerunning with MISE_VERBOSE=1: {format_cmd(cmd)}", file=sys.stderr)
+        try:
+            invoke(verbose=True)
+        except subprocess.CalledProcessError as verbose_exc:
+            if verbose_exc.stdout:
+                print(verbose_exc.stdout, file=sys.stderr, end="")
+            if verbose_exc.stderr:
+                print(verbose_exc.stderr, file=sys.stderr, end="")
+    raise last_exc
+
+
+def say(message: str) -> None:
+    print(message, flush=True)
+
+
+def latest_install_dir(tool: str) -> Path:
+    root = DATA_DIR / "installs" / f"jll-{tool}"
+    if not root.is_dir():
+        raise AssertionError(f"missing install root for {tool}: {root}")
+
+    candidates = [path for path in root.iterdir() if path.is_dir()]
+    if not candidates:
+        raise AssertionError(f"no installed versions found for {tool}: {root}")
+
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def assert_manifest(
+    tool: str,
+    *,
+    min_packages: int,
+    min_lib_entries: int,
+    min_path_entries: int,
+    required_package: str,
+) -> None:
+    manifest_path = latest_install_dir(tool) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    packages = manifest.get("packages", [])
+    env = manifest.get("env", {})
+    package_names = {pkg["package"] for pkg in packages}
+
+    if len(packages) < min_packages:
+        raise AssertionError(
+            f"{manifest_path}: expected at least {min_packages} packages, got {len(packages)}"
+        )
+    if len(env.get("lib_entries", [])) < min_lib_entries:
+        raise AssertionError(
+            f"{manifest_path}: expected at least {min_lib_entries} library entries"
+        )
+    if len(env.get("path_entries", [])) < min_path_entries:
+        raise AssertionError(
+            f"{manifest_path}: expected at least {min_path_entries} PATH entries"
+        )
+    if required_package not in package_names:
+        raise AssertionError(f"{manifest_path}: missing package {required_package}")
+    if env.get("lib_env") != EXPECTED_LIB_ENV:
+        raise AssertionError(
+            f"{manifest_path}: expected lib_env={EXPECTED_LIB_ENV}, got {env.get('lib_env')}"
+        )
+
+
+def check_version_listing(tool: str) -> None:
+    output = run(["mise", "ls-remote", f"jll:{tool}"], capture=True, retries=3)
+    if not output.strip():
+        raise AssertionError(f"version listing returned no results for {tool}")
+
+
+def install_latest(tool: str) -> None:
+    run(["mise", "install", "--force", f"jll:{tool}@latest"], retries=2)
+
+
+def run_exec_smoke(tool: str) -> None:
+    command = EXEC_SMOKE_TESTS.get(tool)
+    if command is None:
+        raise AssertionError(f"no exec smoke test configured for {tool}")
+    run(["mise", "exec", f"jll:{tool}@latest", "--", *command], retries=2)
+
+
+def main() -> int:
+    say("Linking plugin...")
+    run(["mise", "plugin", "link", "--force", "jll", "."])
+
+    say("Clearing mise cache...")
+    run(["mise", "cache", "clear"])
+
+    say("Checking remote version listing...")
+    for tool in VERSION_TOOLS:
+        say(f"  - {tool}")
+        check_version_listing(tool)
+
+    say("Installing and exercising CLI-oriented packages...")
+    for tool in EXEC_SMOKE_TESTS:
+        say(f"  - {tool}")
+        install_latest(tool)
+        run_exec_smoke(tool)
+
+    say("Installing and validating library-oriented packages...")
+    for tool, expectation in LIBRARY_ASSERTIONS.items():
+        say(f"  - {tool}")
+        install_latest(tool)
+        assert_manifest(tool, **expectation)
+
+    say("✓ JLL backend smoke tests passed")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(exc.returncode) from exc
+    except AssertionError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1) from exc
